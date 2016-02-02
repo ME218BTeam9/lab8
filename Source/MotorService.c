@@ -23,7 +23,6 @@
 /* include header files for this state machine as well as any machines at the
    next lower level in the hierarchy that are sub-machines to this machine
 */
-#include <math.h>
 #include "ES_Configure.h"
 #include "ES_Framework.h"
 #include "inc/hw_memmap.h"
@@ -36,6 +35,7 @@
 #include "MotorService.h"
 #include "PWM8Tiva.h"
 #include "ADService.h"
+#include "ADMulti.h"
 #include "inc/hw_pwm.h"
 #include "inc/hw_timer.h"
 #include "inc/hw_nvic.h"
@@ -44,44 +44,28 @@
 #include "driverlib/sysctl.h"
 #include "driverlib/pin_map.h"
 #include "driverlib/gpio.h"
+#include "SPIservice.h"
 
 /*----------------------------- Module Defines ----------------------------*/
 #define ALL_BITS (0xff<<2)
-#define PWMTicksPerMS 40
-#define PeriodInMS 1000 //10000Hz
-#define TicksPerMS 40000
+#define PWMTicksPerMS 40000
+#define PeriodInMS 1
 #define BitsPerNibble 4
-#define ONELED BIT0HI
-#define TWOLED BIT0HI|BIT1HI
-#define THREELED BIT0HI|BIT1HI|BIT2HI
-#define FOURLED BIT0HI|BIT1HI|BIT2HI|BIT3HI
-#define FIVELED BIT0HI|BIT1HI|BIT2HI|BIT3HI|BIT4HI
-#define SIXLED BIT0HI|BIT1HI|BIT2HI|BIT3HI|BIT4HI|BIT5HI
-#define SEVENLED BIT0HI|BIT1HI|BIT2HI|BIT3HI|BIT4HI|BIT5HI|BIT6HI
-#define EIGHTLED BIT0HI|BIT1HI|BIT2HI|BIT3HI|BIT4HI|BIT5HI|BIT6HI|BIT7HI
+
 
 static uint32_t Period;
 static uint32_t LastCapture;
 static uint32_t PWM_INTERVAL;
-static uint32_t Timeout = 0;
-static int32_t TargetRPM;
-static uint32_t RPM;
-static float RPMError = 0;
-static float SumError = 0;
-static uint32_t RequestedDuty;
 /*---------------------------- Module Functions ---------------------------*/
 /* prototypes for private functions for this machine.They should be functions
    relevant to the behavior of this state machine
 */
 void InitPWM(void);
-void PWMUpdate(uint32_t PWM_INTERVAL);
-void InitInputCapturePeriod( void );
+static void PWMUpdateMotorRight(int32_t);
+static void PWMUpdateMotorLeft(int32_t);
 static void InitPortB();
-void InputCaptureResponse(void);
-static void LEDUpdate(void);
-void InitControlPeriod( void );
-void ControlResponse (void);
-uint32_t GetRPM(void);
+
+
 
 
 
@@ -90,8 +74,9 @@ uint32_t GetRPM(void);
 // everybody needs a state variable, you may need others as well.
 // type of state variable should match htat of enum in header file
 static MotorServiceState_t CurrentMotorState;
-
-
+static uint32_t data[180];
+static uint32_t IRResult[1];
+static uint32_t TimePerDegree = 150;
 // with the introduction of Gen2, we need a module level Priority var as well
 static uint8_t MyPriority;
 
@@ -122,14 +107,11 @@ bool InitMotorService( uint8_t Priority )
   MyPriority = Priority;
 	InitPWM();
   InitPortB();
-	InitInputCapturePeriod();
-	InitControlPeriod();
 	_HW_Timer_Init(ES_Timer_RATE_1mS);
 	ES_Timer_InitTimer(MOTOR_TIMER, 100);
-	ES_Timer_InitTimer(AD_TIMER, 100);
+	//ES_Timer_InitTimer(AD_TIMER, 100);
 	ThisEvent.EventType = ES_INIT;
 	CurrentMotorState = InitMotorStep;
-	Timeout=0;
 	printf("Initialization done\n\r");
   if (ES_PostToService( MyPriority, ThisEvent) == true)
   {
@@ -181,7 +163,9 @@ bool PostMotorService( ES_Event ThisEvent )
 ****************************************************************************/
 ES_Event RunMotorService( ES_Event ThisEvent )
 {
+	ES_Event New_Event;
   ES_Event ReturnEvent;
+	ES_Event PostEvent;
   ReturnEvent.EventType = ES_NO_EVENT; // assume no errors
 
   switch (CurrentMotorState)
@@ -189,37 +173,126 @@ ES_Event RunMotorService( ES_Event ThisEvent )
     case InitMotorStep:       // If current state is initial Psedudo State
         if ( ThisEvent.EventType == ES_INIT )// only respond to ES_Init
         {
-            CurrentMotorState = MotorDCState;		
+            CurrentMotorState = MotorCommand;		
             //printf("CurrentStep %d\r\n", CurrentStep);		
-						printf("Motor DC\r\n");	
-            ES_Timer_InitTimer(MOTOR_TIMER, 50);					
+						printf("\r\n Motor Inited \r\n");	
+//            New_Event.EventParam = Stop;
+//            New_Event.EventType = NEW_COMMAND;
+//            PostMotorService(New_Event);	
+           ES_Timer_InitTimer(MOTOR_TIMER, 100);			
+//					PWMUpdateMotorRight(-100);//  PWM counterclockwise	
+//          PWMUpdateMotorLeft(-100);//  PWM counterclockwise					
          }
     break;
 
-    case MotorDCState:       // If current state is state one
-
-        if (ThisEvent.EventType == ES_TIMEOUT && ThisEvent.EventParam == MOTOR_TIMER) 
-				{ // Should init another FullStepTimer
-					PWM_INTERVAL = GetInterval();
-					PWMUpdate(PWM_INTERVAL);
-					ES_Timer_InitTimer(MOTOR_TIMER, 50);
-					//printf("Period: %d\r\n", Period);
-					HWREG(GPIO_PORTC_BASE+(GPIO_O_DATA + ALL_BITS)) |= BIT5HI;
-					RPM = 60 * 1000* TicksPerMS/ (Period * 4) / 298;
-	        printf("RPM is %d\n\r", RPM);
-					printf("TargetRPM = %u \n\r ", TargetRPM);
-          printf("RPMError = %f\n\r ", RPMError);
-          printf("SumError = %f\n\r ", SumError);
-					//printf("Timeout is %d\n\r", Timeout);
-          HWREG(GPIO_PORTC_BASE+(GPIO_O_DATA + ALL_BITS)) &= BIT5LO;	
-					
+    case MotorCommand:       
+				if (ThisEvent.EventType == ES_TIMEOUT && ThisEvent.EventParam == DEGREE_TIMER)
+				{
+					printf("\r\n Motor task finished \r\n");	
+					PWMUpdateMotorRight(0);// 0% PWM
+					PWMUpdateMotorLeft(0); //0% PWM
 				}
-				
+        if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == Stop) 
+				{ 
+					printf("\r\n Motor stop \r\n");	
+					PWMUpdateMotorRight(0);// 0% PWM
+					PWMUpdateMotorLeft(0); //0% PWM					
+	        ES_Timer_InitTimer(DEGREE_TIMER, 100);	
+				}		
+				// 90  degree clockwise
+				 if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == CW90) 
+				 {
+					printf("\r\n Motor 90 clockwise \r\n");	
+					PWMUpdateMotorLeft(50); //	 PWM clockwise	
+					PWMUpdateMotorRight(-50);//  PWM counterclockwise
+					ES_Timer_InitTimer(DEGREE_TIMER, 90 * TimePerDegree);
+				 } 
+
+				 // 45 degree clockwise
+				 if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == CW45) 
+				 {
+					  printf("\r\n Motor 45 clockwise \r\n");	
+					PWMUpdateMotorRight(-80);// 50% PWM counterclockerwise
+					PWMUpdateMotorLeft(80); // 50% PWM clockwise
+					ES_Timer_InitTimer(DEGREE_TIMER, 45 * TimePerDegree);						 
+				 }
+					// 90 degree counterwise
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == CCW90) 
+				 {
+					 printf("\r\n Motor 90 counterclockwise \r\n");	
+					PWMUpdateMotorRight(50);// clockwise
+					PWMUpdateMotorLeft(-50); // counterwise	
+          ES_Timer_InitTimer(DEGREE_TIMER, 90 * TimePerDegree);					 
+				 }
+			 
+				 	// 45 degree counterwise
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == CCW45) 
+				 {
+					 printf("\r\n Motor 45 counterclockwise \r\n");
+					PWMUpdateMotorRight(80);// clockwise
+					PWMUpdateMotorLeft(-80); // counterwise    			
+					ES_Timer_InitTimer(DEGREE_TIMER, 45 * TimePerDegree);						 
+
+				 }
+				 	// drive farward half speed
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == ForwardHalf) 
+				 {
+					 printf("\r\n Motor forward half speed \r\n");	
+					PWMUpdateMotorRight(50);// clockwise half PWM
+					PWMUpdateMotorLeft(50); // clockwise half PWM			 
+				 }
+
+				 	// drive farward full speed
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == ForwardFull) 
+				 {
+					 printf("\r\n Motor forward full speed \r\n");	
+					PWMUpdateMotorRight(100);// clockwise full PWM
+					PWMUpdateMotorLeft(100); // clockwise full PWM						 
+				 }				 
+         // drive reverse half speed
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == ReverseHalf) 
+				 {
+					  printf("\r\n Motor reverse half speed \r\n");	
+					PWMUpdateMotorRight(-50);// clockwise half PWM
+					PWMUpdateMotorLeft(-50); // clockwise half PWM					 
+				 }			 
+         // drive reverse full speed
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == ReverseFull) 
+				 {
+					 printf("\r\n Motor reverse full speed \r\n");	
+					PWMUpdateMotorRight(-100);// clockwise full PWM
+					PWMUpdateMotorLeft(-100); // clockwise full PWM					 
+				 }			 
+          // align with beacon				 
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == Align) 
+				 {
+					for (int i = 0; i < 360/5; i++){
+						// rotate 5 degree each time
+						PWMUpdateMotorLeft(50); //	 PWM clockwise	
+						PWMUpdateMotorRight(-50);
+						ES_Timer_InitTimer(DEGREE_TIMER, 5 * TimePerDegree);	
+						PWMUpdateMotorLeft(0);						
+						// get data from IR sensor and put into DATA array
+						ADC_MultiInit(1);
+						ADC_MultiRead(IRResult);
+						data[i] = IRResult[0];	
+					}
+				 }					 
+         // drive forward until tape detected
+				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == Drive2Tape) 
+				 {
+         // rotate and find signal
+					//PWMUpdateMotorRight();// clockwise
+					//PWMUpdateMotorLeft(); // clockwise
+          // use interupt to stop					 
+					 ES_Timer_InitTimer(MOTOR_TIMER, TimePerDegree);	
+				 }									 			 				 			
 		break;
 
   }                                   // end switch on Current State
   return ReturnEvent;
 }
+
 
 /***************************************************************************
  private functions
@@ -244,6 +317,21 @@ ES_Event RunMotorService( ES_Event ThisEvent )
 ****************************************************************************/
 void InitPWM()
 {
+// Set PE3 & PF4 as digital outputs and set them low
+	
+HWREG(SYSCTL_RCGCGPIO) |= SYSCTL_RCGCGPIO_R4;     //Port E
+while ((HWREG(SYSCTL_PRGPIO) & SYSCTL_RCGCGPIO_R4) != SYSCTL_RCGCGPIO_R4);
+HWREG(GPIO_PORTE_BASE+GPIO_O_DEN) |= (BIT3HI);
+HWREG(GPIO_PORTE_BASE+GPIO_O_DIR) |= ( BIT3HI);
+HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) &= ~(BIT3HI);
+
+HWREG(SYSCTL_RCGCGPIO) |= SYSCTL_RCGCGPIO_R5;     //Port F
+while ((HWREG(SYSCTL_PRGPIO) & SYSCTL_RCGCGPIO_R5) != SYSCTL_RCGCGPIO_R5);
+HWREG(GPIO_PORTF_BASE+GPIO_O_DEN) |= (BIT4HI);
+HWREG(GPIO_PORTF_BASE+GPIO_O_DIR) |= ( BIT4HI);
+HWREG(GPIO_PORTF_BASE+(GPIO_O_DATA + ALL_BITS)) &= ~(BIT4HI);	
+
+	
 volatile uint32_t Dummy;
 	// start by enabling the clock to the PWM Module (PWM0)
 HWREG(SYSCTL_RCGCPWM) |= SYSCTL_RCGCPWM_R0;
@@ -272,7 +360,9 @@ HWREG( PWM0_BASE+PWM_O_2_LOAD) = ((PeriodInMS * PWMTicksPerMS)-1)>>1;
 HWREG( PWM0_BASE+PWM_O_2_CMPA) = ((PeriodInMS * PWMTicksPerMS)-1)>>2;
 // Set the initial Duty cycle on B to 25% by programming the compare value
 // to 1/4 the period
-//HWREG( PWM0_BASE+PWM_O_0_CMPB) = ((PeriodInMS * PWMTicksPerMS))>>3;
+// HWREG( PWM0_BASE+PWM_O_0_CMPB) = ((PeriodInMS * PWMTicksPerMS))>>3;
+//HWREG( PWM0_BASE+PWM_O_2_CMPB) = ((PeriodInMS * PWMTicksPerMS)-1)>>2;
+
 // enable the PWM outputs
 HWREG( PWM0_BASE+PWM_O_ENABLE) |= (PWM_ENABLE_PWM4EN | PWM_ENABLE_PWM5EN);
 // Set the Output Enables to happen locally synchronized to counter=0
@@ -281,7 +371,7 @@ HWREG( PWM0_BASE+PWM_O_ENUPD) = (HWREG( PWM0_BASE+PWM_O_ENUPD) &
 (PWM_ENUPD_ENUPD0_LSYNC | PWM_ENUPD_ENUPD1_LSYNC);
 // now configure the Port B pins to be PWM outputs
 // start by selecting the alternate function for Pe4 & 5
-HWREG(GPIO_PORTE_BASE+GPIO_O_AFSEL) |= (BIT4HI | BIT5HI);
+HWREG(GPIO_PORTE_BASE+GPIO_O_AFSEL) |= (BIT4HI|BIT5HI);
 // now choose to map PWM to those pins, this is a mux value of 4 that we
 // want to use for specifying the function on bits 4 & 5
 HWREG(GPIO_PORTE_BASE+GPIO_O_PCTL) =
@@ -290,6 +380,7 @@ HWREG(GPIO_PORTE_BASE+GPIO_O_PCTL) =
 HWREG(GPIO_PORTE_BASE+GPIO_O_DEN) |= (BIT4HI | BIT5HI);
 // make pins 4 & 5 on Port E into outputs
 HWREG(GPIO_PORTE_BASE+GPIO_O_DIR) |= (BIT4HI |BIT5HI);
+
 // set the up/down count mode and enable the PWM generator, both generator updates locally synchronized to zero count
 HWREG(PWM0_BASE+ PWM_O_2_CTL) |= (PWM_2_CTL_MODE | PWM_2_CTL_ENABLE | PWM_2_CTL_GENAUPD_LS | PWM_2_CTL_GENBUPD_LS);
 }
@@ -311,17 +402,71 @@ HWREG(PWM0_BASE+ PWM_O_2_CTL) |= (PWM_2_CTL_MODE | PWM_2_CTL_ENABLE | PWM_2_CTL_
  Author
      Han Ye
 ****************************************************************************/
-void PWMUpdate(uint32_t PWM_INTERVAL)
+static void PWMUpdateMotorRight(int32_t DutyRight)
 {
-	// PWM_INTERVAL = GetInterval();
-	if (PWM_INTERVAL == 100) {
-		HWREG( PWM0_BASE+PWM_O_2_GENA) = (PWM_2_GENA_ACTCMPAU_ONE | PWM_2_GENA_ACTCMPAD_ONE );
-	  //printf("PWM_INTERVAL = %u \r\n", PWM_INTERVAL);
+	if (DutyRight < 0) {
+		// Set PF4 to high, use the lower part of PWM
+	  HWREG(GPIO_PORTF_BASE+(GPIO_O_DATA + ALL_BITS)) |= BIT4HI;
+		
+		if(DutyRight <= -100){
+			HWREG( PWM0_BASE+PWM_O_2_GENA) = (PWM_2_GENA_ACTCMPAU_ONE | PWM_2_GENA_ACTCMPAD_ONE);
+			HWREG(PWM0_BASE+PWM_O_2_CMPA) = (HWREG(PWM0_BASE+PWM_O_2_LOAD)) / 2;
+		}		
+		else {
+			HWREG(PWM0_BASE+PWM_O_2_GENA) = (PWM_2_GENA_ACTCMPAU_ONE | PWM_2_GENA_ACTCMPAD_ZERO);
+			HWREG(PWM0_BASE+PWM_O_2_CMPA) = (HWREG(PWM0_BASE+PWM_O_2_LOAD))*(-DutyRight)/100;
+		}
+		
 	}
 	else {
-		HWREG(PWM0_BASE+PWM_O_2_CMPA) = (HWREG(PWM0_BASE+PWM_O_2_LOAD))*(100-PWM_INTERVAL)/100;
-		HWREG( PWM0_BASE+PWM_O_2_GENA) = (PWM_2_GENA_ACTCMPAU_ONE | PWM_2_GENA_ACTCMPAD_ZERO);	
-		//printf("\r\nPWM_INTERVAL = %u \r", PWM_INTERVAL);
+		// Set PF4 to low, use the higher part of PWM
+	  HWREG(GPIO_PORTF_BASE+(GPIO_O_DATA + ALL_BITS)) &= ~BIT4HI;
+		if (DutyRight == 0){
+			HWREG( PWM0_BASE+PWM_O_2_GENA) = (PWM_2_GENA_ACTCMPAU_ZERO | PWM_2_GENA_ACTCMPAD_ZERO);
+			HWREG(PWM0_BASE+PWM_O_2_CMPA) = (HWREG(PWM0_BASE+PWM_O_2_LOAD)) >> 1;
+		} 
+		else if(DutyRight >= 100){
+			HWREG( PWM0_BASE+PWM_O_2_GENA) = (PWM_2_GENA_ACTCMPAU_ONE | PWM_2_GENA_ACTCMPAD_ONE );
+			HWREG(PWM0_BASE+PWM_O_2_CMPA) = (HWREG(PWM0_BASE+PWM_O_2_LOAD)) >> 1;
+		} else {
+		  HWREG(PWM0_BASE+PWM_O_2_GENA) = (PWM_2_GENA_ACTCMPAU_ONE | PWM_2_GENA_ACTCMPAD_ZERO);
+			HWREG(PWM0_BASE+PWM_O_2_CMPA) = (HWREG(PWM0_BASE+PWM_O_2_LOAD))*(100-DutyRight)/100;
+		}
+
+	}
+}
+
+static void PWMUpdateMotorLeft(int32_t DutyRight)
+{
+	if (DutyRight < 0) {
+		// Set PE3 to high, use the lower part of PWM
+	  HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) |= BIT3HI;
+		
+		if(DutyRight <= -100){
+			HWREG( PWM0_BASE+PWM_O_2_GENB) = (PWM_2_GENB_ACTCMPBU_ONE | PWM_2_GENB_ACTCMPBD_ONE);
+			HWREG(PWM0_BASE+PWM_O_2_CMPB) = (HWREG(PWM0_BASE+PWM_O_2_LOAD)) >> 1;
+		}		
+		else {
+			HWREG(PWM0_BASE+PWM_O_2_GENB) = (PWM_2_GENB_ACTCMPBU_ONE | PWM_2_GENB_ACTCMPBD_ZERO);
+			HWREG(PWM0_BASE+PWM_O_2_CMPB) = (HWREG(PWM0_BASE+PWM_O_2_LOAD))*(-DutyRight)/100;
+		}
+		
+	}
+	else {
+		// Set PE3 to low, use the higher part of PWM
+	  HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) &= ~BIT3HI;
+		if (DutyRight == 0){
+			HWREG( PWM0_BASE+PWM_O_2_GENB) = (PWM_2_GENB_ACTCMPBU_ZERO | PWM_2_GENB_ACTCMPBD_ZERO);
+			HWREG(PWM0_BASE+PWM_O_2_CMPB) = (HWREG(PWM0_BASE+PWM_O_2_LOAD)) >> 1;
+		} 
+		else if(DutyRight >= 100){
+			HWREG( PWM0_BASE+PWM_O_2_GENB) = (PWM_2_GENB_ACTCMPBU_ONE | PWM_2_GENB_ACTCMPBD_ONE );
+			HWREG(PWM0_BASE+PWM_O_2_CMPB) = (HWREG(PWM0_BASE+PWM_O_2_LOAD)) >> 1;
+		} else {
+		  HWREG(PWM0_BASE+PWM_O_2_GENB) = (PWM_2_GENB_ACTCMPBU_ONE | PWM_2_GENB_ACTCMPBD_ZERO);
+			HWREG(PWM0_BASE+PWM_O_2_CMPB) = (HWREG(PWM0_BASE+PWM_O_2_LOAD))*(100-DutyRight)/100;
+		}
+
 	}
 }
 
@@ -357,225 +502,3 @@ static void InitPortB()
 	HWREG(GPIO_PORTB_BASE + (GPIO_O_DATA + ALL_BITS)) &= BIT7LO; // set all low first
 	
 }
-/****************************************************************************
- Function
-     InitInputCapturePeriod
-
- Parameters
-     uint8_t : the priorty of this service
-
- Returns
-     bool, false if error in initialization, true otherwise
-
- Description
-     Saves away the priority, sets up the initial transition and does any
-     other required initialization for this state machine
- Notes
-
- Author
-     Han Ye
-****************************************************************************/
-void InitInputCapturePeriod( void ){
-			// start by enabling the clock to the timer (Wide Timer 0)
-			HWREG(SYSCTL_RCGCWTIMER) |= SYSCTL_RCGCWTIMER_R0;
-			// enable the clock to Port C
-			HWREG(SYSCTL_RCGCGPIO) |= SYSCTL_RCGCGPIO_R2;
-			// since we added this Port C clock init, we can immediately start
-			// into configuring the timer, no need for further delay
-			// make sure that timer (Timer A) is disabled before configuring
-			HWREG(WTIMER0_BASE+TIMER_O_CTL) &= ~TIMER_CTL_TAEN;
-			// set it up in 32bit wide (individual, not concatenated) mode
-			// the constant name derives from the 16/32 bit timer, but this is a 32/64
-			// bit timer so we are setting the 32bit mode
-			HWREG(WTIMER0_BASE+TIMER_O_CFG) = TIMER_CFG_16_BIT;
-			// we want to use the full 32 bit count, so initialize the Interval Load
-			// register to 0xffff.ffff (its default value :-)
-			HWREG(WTIMER0_BASE+TIMER_O_TAILR) = 0xffffffff;
-			// set up timer A in capture mode (TAMR=3, TAAMS = 0),
-			// for edge time (TACMR = 1) and up-counting (TACDIR = 1)
-			HWREG(WTIMER0_BASE+TIMER_O_TAMR) =
-			(HWREG(WTIMER0_BASE+TIMER_O_TAMR) & ~TIMER_TAMR_TAAMS) |
-			(TIMER_TAMR_TACDIR | TIMER_TAMR_TACMR | TIMER_TAMR_TAMR_CAP);
-			// To set the event to rising edge, we need to modify the TAEVENT bits
-			// in GPTMCTL. Rising edge = 00, so we clear the TAEVENT bits
-			HWREG(WTIMER0_BASE+TIMER_O_CTL) &= ~TIMER_CTL_TAEVENT_M;
-			// Now Set up the port to do the capture (clock was enabled earlier)
-			// start by setting the alternate function for Port C bit 4 (WT0CCP0)
-			HWREG(GPIO_PORTC_BASE+GPIO_O_AFSEL) |= BIT4HI;
-			// Then, map bit 4's alternate function to WT0CCP0
-			// 7 is the mux value to select WT0CCP0, 16 to shift it over to the
-			// right nibble for bit 4 (4 bits/nibble * 4 bits)
-			HWREG(GPIO_PORTC_BASE+GPIO_O_PCTL) =
-			(HWREG(GPIO_PORTC_BASE+GPIO_O_PCTL) & 0xfff0ffff) + (7<<16);
-			// Enable pin on Port C for digital I/O
-			HWREG(GPIO_PORTC_BASE+GPIO_O_DEN) |= BIT4HI;
-			// make pin 4 on Port C into an input
-			HWREG(GPIO_PORTC_BASE+GPIO_O_DIR) &= BIT4LO;
-			// back to the timer to enable a local capture interrupt
-			HWREG(WTIMER0_BASE+TIMER_O_IMR) |= TIMER_IMR_CAEIM;
-			// enable the Timer A in Wide Timer 0 interrupt in the NVIC
-			// it is interrupt number 94 so appears in EN2 at bit 30
-			HWREG(NVIC_EN2) |= BIT30HI;
-			// make sure interrupts are enabled globally
-			__enable_irq();
-			// now kick the timer off by enabling it and enabling the timer to
-			// stall while stopped by the debugger
-			HWREG(WTIMER0_BASE+TIMER_O_CTL) |= (TIMER_CTL_TAEN | TIMER_CTL_TASTALL);
-			// printf("InitInputCapturePeriod Done\r\n");
-}
-/****************************************************************************
- Function
-     InitInputCapturePeriod
-
- Parameters
-     uint8_t : the priorty of this service
-
- Returns
-     bool, false if error in initialization, true otherwise
-
- Description
-     Saves away the priority, sets up the initial transition and does any
-     other required initialization for this state machine
- Notes
-
- Author
-     Han Ye
-****************************************************************************/
-void InputCaptureResponse( void ){
-		uint32_t ThisCapture;
-		// start by clearing the source of the interrupt, the input capture event
-
-		HWREG(WTIMER0_BASE+TIMER_O_ICR) = TIMER_ICR_CAECINT;
-		// now grab the captured value and calculate the period
-		ThisCapture = HWREG(WTIMER0_BASE+TIMER_O_TAR);
-		Period = ThisCapture - LastCapture;
-		// update LastCapture to prepare for the next edge
-		LastCapture = ThisCapture;
-	  //printf("Period: %d\r\n", Period);
-	  //LEDUpdate();
-}
-
-/****************************************************************************
- Function
-     LEDUpdate
-
- Parameters
-     uint8_t : the priorty of this service
-
- Returns
-     bool, false if error in initialization, true otherwise
-
- Description
-     Saves away the priority, sets up the initial transition and does any
-     other required initialization for this state machine
- Notes
-
- Author
-     Han Ye
-****************************************************************************/
-static void LEDUpdate(void){
-	HWREG(GPIO_PORTC_BASE+(GPIO_O_DATA + ALL_BITS)) |= BIT6HI;
-		if (Period <= 20000)
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= ONELED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= ONELED;
-	}
-		else	if (Period > 20000 && Period < 21000)
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= TWOLED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= TWOLED;
-	}
-		else	if (Period > 21000 && Period <= 26000)
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= THREELED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= THREELED;
-	}
-		else	if (Period > 26000 && Period <= 30000)
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= FOURLED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= FOURLED;
-	}
-		else	if (Period> 30000 && Period <= 50000)
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= FIVELED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= FIVELED;
-	}
-		else	if (Period > 50000 && Period <= 75000)
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= SIXLED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= SIXLED;
-	}
-		else	if (Period > 75000 && Period <= 100000)
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= SEVENLED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= SEVENLED;
-	}
-		else
-	{
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) |= EIGHTLED; 
-		HWREG(GPIO_PORTB_BASE+(GPIO_O_DATA + ALL_BITS)) &= EIGHTLED;
-	}
-  HWREG(GPIO_PORTC_BASE+(GPIO_O_DATA + ALL_BITS)) &= BIT6LO;
-
-}
-
-uint32_t GetRPM(void){
-	return RPM;
-}
-
-void InitControlPeriod( void ){
-		//volatile uint32_t Dummy; // use volatile to avoid over-optimization
-		// start by enabling the clock to the timer (Wide Timer 0)
-		HWREG(SYSCTL_RCGCWTIMER) |= SYSCTL_RCGCWTIMER_R0; // kill a few cycles to let the clock get going
-		//Dummy = HWREG(SYSCTL_RCGCGPIO);
-		// make sure that timer (Timer A) is disabled before configuring
-		HWREG(WTIMER0_BASE+TIMER_O_CTL) &= ~TIMER_CTL_TBEN;
-		// set it up in 32bit wide (individual, not concatenated) mode
-		HWREG(WTIMER0_BASE+TIMER_O_CFG) = TIMER_CFG_16_BIT;
-		// set up timer A in periodic mode so that it repeats the time-outs
-		HWREG(WTIMER0_BASE+TIMER_O_TBMR) =
-		(HWREG(WTIMER0_BASE+TIMER_O_TBMR)& ~TIMER_TBMR_TBMR_M)| TIMER_TBMR_TBMR_PERIOD;
-		// set timeout to 2mS
-		HWREG(WTIMER0_BASE+TIMER_O_TBILR) = TicksPerMS * 2;
-		// enable a local timeout interrupt
-		HWREG(WTIMER0_BASE+TIMER_O_IMR) |= TIMER_IMR_TBTOIM;
-		// enable the Timer A in Wide Timer 0 interrupt in the NVIC
-		// it is interrupt number 95 so appears in EN2 at bit 31
-		HWREG(NVIC_EN2) = BIT31HI;
-		// make sure interrupts are enabled globally
-		__enable_irq();
-		// now kick the timer off by enabling it and enabling the timer to
-		// stall while stopped by the debugger
-		HWREG(WTIMER0_BASE+TIMER_O_CTL) |= (TIMER_CTL_TBEN | TIMER_CTL_TBSTALL);
-		//printf("ControlPeriod Initialized");
-}
-
-void ControlResponse (void){
-	// start by clearing the source of the interrupt
-	HWREG(WTIMER0_BASE+TIMER_O_ICR) = TIMER_ICR_TBTOCINT;
-	//Timeout++;
-	//PWM_INTERVAL = GetInterval();
-	
-	float kp = .3;
-	float ki = .1;
-	
-	//TargetRPM =  ((float)PWM_INTERVAL * 0.7683 - 11.544);
-	TargetRPM =  ((float)PWM_INTERVAL * 0.205 + 1.033);
-	RPM = 60 * 1000* TicksPerMS/ (Period * 4) / 298;
-	RPMError = (float)TargetRPM - RPM;
-	SumError += RPMError;
-	RequestedDuty = kp*(RPMError + (ki*SumError));
-	if (RequestedDuty >= 100)
-	{ 
-		RequestedDuty = 100;
-		SumError -= RPMError;
-	}
-	else if (RequestedDuty <= 0)
-	{ 
-		RequestedDuty = 0;
-		SumError -= RPMError;
-	}
-	PWMUpdate((uint32_t)RequestedDuty);
-  //printf("RequestedDuty = %u \r\n", RequestedDuty);
-}
-
