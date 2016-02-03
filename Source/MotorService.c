@@ -51,8 +51,10 @@
 #define PWMTicksPerMS 40000
 #define PeriodInMS 1
 #define BitsPerNibble 4
-
-
+#define OneCircleStepNumber 72	// number of steps in one circle rotation
+#define TimePerDegree 150			// for rotating task
+#define AlignPin GPIO_PIN_0
+#define TapePin GPIO_PIN_1
 static uint32_t Period;
 static uint32_t LastCapture;
 static uint32_t PWM_INTERVAL;
@@ -64,8 +66,7 @@ void InitPWM(void);
 static void PWMUpdateMotorRight(int32_t);
 static void PWMUpdateMotorLeft(int32_t);
 static void InitPortB();
-
-
+static void StepAlign(void);
 
 
 
@@ -74,9 +75,11 @@ static void InitPortB();
 // everybody needs a state variable, you may need others as well.
 // type of state variable should match htat of enum in header file
 static MotorServiceState_t CurrentMotorState;
-static uint32_t data[180];
-static uint32_t IRResult[1];
-static uint32_t TimePerDegree = 150;
+//static uint32_t data[OneCircleStepNumber];
+static uint8_t IRResult;
+static uint8_t TapeResult;
+static uint32_t stepcount;
+
 // with the introduction of Gen2, we need a module level Priority var as well
 static uint8_t MyPriority;
 
@@ -165,7 +168,6 @@ ES_Event RunMotorService( ES_Event ThisEvent )
 {
 	ES_Event New_Event;
   ES_Event ReturnEvent;
-	ES_Event PostEvent;
   ReturnEvent.EventType = ES_NO_EVENT; // assume no errors
 
   switch (CurrentMotorState)
@@ -185,7 +187,11 @@ ES_Event RunMotorService( ES_Event ThisEvent )
          }
     break;
 
-    case MotorCommand:       
+    case MotorCommand: 
+					 IRResult  = HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) & AlignPin; 
+					 printf("\r\n IR result is %i", IRResult);			
+					TapeResult  = HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) & TapePin; 
+					 printf("\r\n Tape result is %i", TapeResult);
 				if (ThisEvent.EventType == ES_TIMEOUT && ThisEvent.EventParam == DEGREE_TIMER)
 				{
 					printf("\r\n Motor task finished \r\n");	
@@ -265,32 +271,71 @@ ES_Event RunMotorService( ES_Event ThisEvent )
 				 }			 
           // align with beacon				 
 				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == Align) 
-				 {
-					for (int i = 0; i < 360/5; i++){
-						// rotate 5 degree each time
-						PWMUpdateMotorLeft(50); //	 PWM clockwise	
-						PWMUpdateMotorRight(-50);
-						ES_Timer_InitTimer(DEGREE_TIMER, 5 * TimePerDegree);	
-						PWMUpdateMotorLeft(0);						
-						// get data from IR sensor and put into DATA array
-						ADC_MultiInit(1);
-						ADC_MultiRead(IRResult);
-						data[i] = IRResult[0];	
-					}
+				 {	
+					  CurrentMotorState = MotorAlign;	
+					  // start step 
+					  stepcount = 0;	
+					  StepAlign();
 				 }					 
          // drive forward until tape detected
 				  if (ThisEvent.EventType == NEW_COMMAND && ThisEvent.EventParam == Drive2Tape) 
 				 {
-         // rotate and find signal
-					//PWMUpdateMotorRight();// clockwise
-					//PWMUpdateMotorLeft(); // clockwise
-          // use interupt to stop					 
-					 ES_Timer_InitTimer(MOTOR_TIMER, TimePerDegree);	
-				 }									 			 				 			
+					PWMUpdateMotorRight(100);// clockwise full PWM
+					PWMUpdateMotorLeft(100); // clockwise full PWM		
+					ES_Timer_InitTimer(STEP_TIMER, 100);						 
+				 }			
+					if (ThisEvent.EventType == ES_TIMEOUT && ThisEvent.EventParam == STEP_TIMER)
+				 {	
+					 TapeResult  = HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) & TapePin; 
+					 printf("\r\n Tape result is %i", TapeResult);
+					if (TapeResult){
+						PWMUpdateMotorRight(0);
+					  PWMUpdateMotorLeft(0); 
+						printf("\r\n Tape found ! \r\n");
+				  } else {
+						PWMUpdateMotorRight(100);
+						PWMUpdateMotorLeft(100); 		
+						ES_Timer_InitTimer(STEP_TIMER, 100);			
+					}
+				 }							 
+		break;
+				 
+		case MotorAlign:
+				 if (ThisEvent.EventType == ES_TIMEOUT && ThisEvent.EventParam == STEP_TIMER) 
+				 {	
+					 if (stepcount <= OneCircleStepNumber){
+					  PWMUpdateMotorLeft(0);						
+					  PWMUpdateMotorRight(0);						
+						StepAlign();
+					 }else{
+						 printf("\r\n Not found beacon");
+					 }						 
+				 }
 		break;
 
   }                                   // end switch on Current State
   return ReturnEvent;
+}
+
+static void StepAlign(void){
+
+		// read IR Sensor
+		//ADC_MultiInit(1);
+		//ADC_MultiRead(IRResult);
+		//data[stepcount] = IRResult[0];
+		// step + 1
+	IRResult  = HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) & AlignPin; 
+	if(!IRResult){
+		stepcount++;
+		// rotate 5 degree each time
+		ES_Timer_InitTimer(STEP_TIMER, 5 * TimePerDegree);
+		PWMUpdateMotorLeft(50); //	 PWM clockwise	
+		PWMUpdateMotorRight(-50);
+	}else{
+		printf("\r\n Aligned!");
+		CurrentMotorState = MotorCommand;
+	}
+	
 }
 
 
@@ -321,10 +366,12 @@ void InitPWM()
 	
 HWREG(SYSCTL_RCGCGPIO) |= SYSCTL_RCGCGPIO_R4;     //Port E
 while ((HWREG(SYSCTL_PRGPIO) & SYSCTL_RCGCGPIO_R4) != SYSCTL_RCGCGPIO_R4);
-HWREG(GPIO_PORTE_BASE+GPIO_O_DEN) |= (BIT3HI);
+HWREG(GPIO_PORTE_BASE+GPIO_O_DEN) |= (BIT3HI | AlignPin | TapePin);
 HWREG(GPIO_PORTE_BASE+GPIO_O_DIR) |= ( BIT3HI);
 HWREG(GPIO_PORTE_BASE+(GPIO_O_DATA + ALL_BITS)) &= ~(BIT3HI);
-
+//init the pin for aligning the beacon and sensing the tape as input
+HWREG(GPIO_PORTE_BASE+GPIO_O_DIR) &= ~(AlignPin | TapePin);
+	
 HWREG(SYSCTL_RCGCGPIO) |= SYSCTL_RCGCGPIO_R5;     //Port F
 while ((HWREG(SYSCTL_PRGPIO) & SYSCTL_RCGCGPIO_R5) != SYSCTL_RCGCGPIO_R5);
 HWREG(GPIO_PORTF_BASE+GPIO_O_DEN) |= (BIT4HI);
