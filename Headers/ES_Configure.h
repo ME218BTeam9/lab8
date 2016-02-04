@@ -38,11 +38,11 @@
 // services are added in numeric sequence (1,2,3,...) with increasing 
 // priorities
 // the header file with the public function prototypes
-#define SERV_0_HEADER "MotorService.h" 
+#define SERV_0_HEADER "SPIService.h"
 // the name of the Init function
-#define SERV_0_INIT InitMotorService
+#define SERV_0_INIT InitSPIService
 // the name of the run function
-#define SERV_0_RUN RunMotorService
+#define SERV_0_RUN RunSPIService
 // How big should this services Queue be?
 #define SERV_0_QUEUE_SIZE 3
 
@@ -54,11 +54,11 @@
 // These are the definitions for Service 1
 #if NUM_SERVICES > 1
 // the header file with the public function prototypes
-#define SERV_1_HEADER "ADService.h"
+#define SERV_1_HEADER "MotorService.h"
 // the name of the Init function
-#define SERV_1_INIT InitADService
+#define SERV_1_INIT InitMotorService
 // the name of the run function
-#define SERV_1_RUN RunADService
+#define SERV_1_RUN RunMotorService
 // How big should this services Queue be?
 #define SERV_1_QUEUE_SIZE 3
 #endif
@@ -67,11 +67,11 @@
 // These are the definitions for Service 2
 #if NUM_SERVICES > 2
 // the header file with the public function prototypes
-#define SERV_2_HEADER "ADService.h"
+#define SERV_2_HEADER "SPIService.h"
 // the name of the Init function
-#define SERV_2_INIT InitADService
+#define SERV_2_INIT InitSPIService
 // the name of the run function
-#define SERV_2_RUN RunADService
+#define SERV_2_RUN RunSPIService
 // How big should this services Queue be?
 #define SERV_2_QUEUE_SIZE 3
 #endif
@@ -257,7 +257,10 @@ typedef enum {  ES_NO_EVENT = 0,
                 /* User-defined events start here */
                 ES_NEW_KEY, /* signals a new key received from terminal */
                 ES_LOCK,
-                ES_UNLOCK,             
+                ES_UNLOCK,
+								ES_EOT,
+								NEW_COMMAND,
+								IRFound,
 } ES_EventTyp_t ;
 
 /****************************************************************************/
@@ -266,10 +269,10 @@ typedef enum {  ES_NO_EVENT = 0,
 // services are on that distribution list.
 #define NUM_DIST_LISTS 0
 #if NUM_DIST_LISTS > 0 
-#define DIST_LIST0 PostTestHarnessService0, PostTestHarnessService0
+#define DIST_LIST0 PostMotorService
 #endif
 #if NUM_DIST_LISTS > 1 
-#define DIST_LIST1 PostTestHarnessService1, PostTestHarnessService1
+#define DIST_LIST1 PostSPIService
 #endif
 #if NUM_DIST_LISTS > 2 
 #define DIST_LIST2 PostTemplateFSM
@@ -306,10 +309,10 @@ typedef enum {  ES_NO_EVENT = 0,
 // priority in servicing them
 #define TIMER_UNUSED ((pPostFunc)0)
 #define TIMER0_RESP_FUNC PostMotorService
-#define TIMER1_RESP_FUNC TIMER_UNUSED
-#define TIMER2_RESP_FUNC PostADService
-#define TIMER3_RESP_FUNC TIMER_UNUSED
-#define TIMER4_RESP_FUNC TIMER_UNUSED
+#define TIMER1_RESP_FUNC PostMotorService
+#define TIMER2_RESP_FUNC PostMotorService //PostADService
+#define TIMER3_RESP_FUNC PostSPIService
+#define TIMER4_RESP_FUNC PostMotorService
 #define TIMER5_RESP_FUNC TIMER_UNUSED
 #define TIMER6_RESP_FUNC TIMER_UNUSED
 #define TIMER7_RESP_FUNC TIMER_UNUSED
@@ -330,6 +333,9 @@ typedef enum {  ES_NO_EVENT = 0,
 // These symbolic names should be changed to be relevant to your application 
 
 #define MOTOR_TIMER 0
-#define AD_TIMER 2
+#define DEGREE_TIMER 1
+#define STEP_TIMER 2 //AD_TIMER 2
+#define SPI_TIMER 3
+#define ALIGN_TIMER 4
 
 #endif /* CONFIGURE_H */
